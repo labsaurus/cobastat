@@ -1,0 +1,1614 @@
+<script setup lang="ts">
+import { ref, onMounted, onBeforeUnmount, watch } from 'vue';
+import * as THREE from 'three';
+import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/examples/jsm/renderers/CSS2DRenderer.js';
+import gsap from 'gsap';
+
+interface DataItem {
+  name: string;
+  value: number;
+}
+
+interface DataProps {
+  title: string;
+  data: DataItem[];
+}
+
+interface Props {
+  data: DataProps;
+  theme: string;
+}
+
+const props = defineProps<Props>();
+
+// DOM refs
+const chartContainer = ref<HTMLElement | null>(null);
+
+// Reactive variables for UI controls
+const isSpotlightMode = ref<boolean>(true); // Start in spotlight mode
+const isAutoCamEnabled = ref<boolean>(false);
+const currentRank = ref<number>(0);
+const isRecording = ref<boolean>(false);
+const recordingProgress = ref<number>(0); // Progress percentage for recording
+const isCameraSetupMode = ref<boolean>(true); // Start in camera setup mode
+const isAnimationStarted = ref<boolean>(false); // Track if animation has started
+
+// Variables to store camera setup position and target
+let savedCameraPosition: THREE.Vector3 | null = null;
+let savedControlsTarget: THREE.Vector3 | null = null;
+
+// Three.js variables
+let scene: THREE.Scene;
+let camera: THREE.PerspectiveCamera;
+let renderer: THREE.WebGLRenderer;
+let labelRenderer: CSS2DRenderer;
+let controls: OrbitControls;
+let bars: THREE.Mesh[] = [];
+let labels: CSS2DObject[] = [];
+let flagSprites: THREE.Mesh[] = [];
+let floor: THREE.Mesh;
+let animationInProgress = false;
+let autoCamAnimation: gsap.core.Tween | null = null;
+
+// Recording variables
+let capturer: any = null;
+let recordingStartTime: number = 0;
+let recordingDuration: number = 0;
+let recordingTimer: number | null = null;
+
+// Theme colors
+const themes = {
+  default: {
+    background: 0x121212,
+    barColors: {
+      low: 0x33cc33,    // Green
+      mid: 0xff9933,     // Orange
+      high: 0xff3333     // Red
+    },
+    textColor: 'white',
+    floorColor: 0x333333,
+    gridColor: 0x444444,
+    fogColor: 0x121212,
+    fogDensity: 0.01
+  },
+  vibrant: {
+    background: 0x000000,
+    barColors: {
+      low: 0x00ffcc,     // Teal
+      mid: 0xff66cc,     // Pink
+      high: 0xff3366      // Red-Pink
+    },
+    textColor: 'white',
+    floorColor: 0x222222,
+    gridColor: 0x333333,
+    fogColor: 0x000000,
+    fogDensity: 0.015
+  },
+  cinematic: {
+    background: 0x0a0a0a,
+    barColors: {
+      low: 0x3366ff,     // Blue
+      mid: 0xff9900,     // Orange
+      high: 0xff0000      // Red
+    },
+    textColor: '#f0f0f0',
+    floorColor: 0x1a1a1a,
+    gridColor: 0x2a2a2a,
+    fogColor: 0x0a0a0a,
+    fogDensity: 0.02
+  },
+  sky: {
+    background: 0x87CEEB, // Sky blue (though we'll use texture instead)
+    barColors: {
+      low: 0x4CAF50,     // Green
+      mid: 0xFF9800,     // Orange
+      high: 0xF44336     // Red
+    },
+    textColor: '#333333', // Darker text for better visibility against sky
+    floorColor: 0x4CAF50, // Green for grass (though we'll use texture instead)
+    gridColor: 0xAAAAAA,  // Subtle gray grid
+    gridColor2: 0x666666, // Darker grid for larger grid
+    fogColor: 0x87CEEB,   // Sky blue for fog
+    fogDensity: 0.008     // Lower density for better visibility
+  }
+};
+
+// Initialize Three.js scene
+const initScene = () => {
+  if (!chartContainer.value) return;
+
+  // Create scene
+  scene = new THREE.Scene();
+  const currentTheme = themes[props.theme as keyof typeof themes];
+  
+  // Load sky background texture
+  const textureLoader = new THREE.TextureLoader();
+  // Use import.meta.url to get correct path in Vite
+  const skyTexture = textureLoader.load(new URL('/sky.jpg', import.meta.url).href);
+  scene.background = skyTexture;
+  
+  // Add enhanced fog for depth perception with sky-compatible color
+  const skyFogColor = new THREE.Color(0x87CEEB); // Light blue color for sky
+  scene.fog = new THREE.FogExp2(skyFogColor, 0.008); // Reduced density for better sky visibility
+
+  // Create camera with cinematic field of view and fixed 16:9 aspect ratio
+  const aspect = 16 / 9; // Fixed 16:9 aspect ratio for camera
+  camera = new THREE.PerspectiveCamera(40, aspect, 0.1, 1000); // Narrower FOV for more cinematic look
+  // Position camera for front-facing low-angle view (will be moved during animation)
+  camera.position.set(0, 7, 30); // Centered X, slightly higher Y for low-angle, further back Z for front view
+  camera.lookAt(0, 2, 0); // Look slightly higher above the ground
+
+  // Create WebGL renderer with improved shadow settings
+  renderer = new THREE.WebGLRenderer({ 
+    antialias: true, 
+    alpha: true,
+    shadowMap: true 
+  });
+  
+  // Calculate renderer size to maintain 16:9 aspect ratio within container
+  const containerWidth = chartContainer.value.clientWidth;
+  const containerHeight = chartContainer.value.clientHeight;
+  
+  // Set renderer size to maintain 16:9 aspect ratio
+  renderer.setSize(containerWidth, containerWidth * (9/16));
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  
+  // Center the renderer in the container
+  renderer.domElement.style.display = 'block';
+  renderer.domElement.style.margin = '0 auto';
+  
+  chartContainer.value.appendChild(renderer.domElement);
+  
+  // Create CSS2D renderer for labels
+  labelRenderer = new CSS2DRenderer();
+  labelRenderer.setSize(containerWidth, containerWidth * (9/16));
+  labelRenderer.domElement.style.position = 'absolute';
+  labelRenderer.domElement.style.top = '0';
+  labelRenderer.domElement.style.left = '0';
+  labelRenderer.domElement.style.right = '0';
+  labelRenderer.domElement.style.margin = '0 auto';
+  labelRenderer.domElement.style.pointerEvents = 'none';
+  chartContainer.value.appendChild(labelRenderer.domElement);
+
+  // Add controls with enhanced settings
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.05;
+  controls.rotateSpeed = 0.5;
+  controls.enableZoom = true;
+  controls.enablePan = true; // Enable panning for camera setup mode
+  controls.minDistance = 10;
+  controls.maxDistance = 100;
+  controls.enabled = true; // Enable controls initially for camera setup mode
+
+  // Enhanced lighting setup for outdoor sky visuals
+  const ambientLight = new THREE.AmbientLight(0xffffff, 0.7); // Brighter ambient for outdoor scene
+  scene.add(ambientLight);
+
+  // Main sunlight
+  const sunLight = new THREE.DirectionalLight(0xFFD54F, 1.2); // Warm sunlight color
+  sunLight.position.set(15, 30, 20); // Coming from higher up like the sun
+  sunLight.castShadow = true;
+  sunLight.shadow.mapSize.width = 2048;
+  sunLight.shadow.mapSize.height = 2048;
+  sunLight.shadow.camera.near = 0.5;
+  sunLight.shadow.camera.far = 500;
+  sunLight.shadow.bias = -0.0001;
+  scene.add(sunLight);
+  
+  // Add fill light from opposite side for better illumination
+  const fillLight = new THREE.DirectionalLight(0xE1F5FE, 0.4); // Slight blue tint for sky reflection
+  fillLight.position.set(-10, 10, -10);
+  scene.add(fillLight);
+  
+  // Add rim light for dramatic effect and edge highlighting
+  const rimLight = new THREE.SpotLight(0xFFF8E1, 0.6); // Warm rim light
+  rimLight.position.set(0, 20, -15);
+  rimLight.angle = Math.PI / 4;
+  rimLight.penumbra = 0.5;
+  rimLight.decay = 2;
+  scene.add(rimLight);
+
+  // Create initial floor and grid with default size
+  // This will be updated later when data is loaded
+  const floorSize = 100;
+  const floorGeometry = new THREE.PlaneGeometry(floorSize, floorSize);
+  
+  // Load floor texture
+  const floorTextureLoader = new THREE.TextureLoader();
+  // Use import.meta.url to get correct path in Vite
+  const floorTexture = floorTextureLoader.load(new URL('/floor.jpg', import.meta.url).href);
+  
+  // Set texture repeat to cover large floor area
+  floorTexture.wrapS = THREE.RepeatWrapping;
+  floorTexture.wrapT = THREE.RepeatWrapping;
+  floorTexture.repeat.set(10, 10);
+  
+  const floorMaterial = new THREE.MeshStandardMaterial({ 
+    map: floorTexture,
+    roughness: 0.8,
+    metalness: 0.2,
+    side: THREE.DoubleSide
+  });
+  
+  floor = new THREE.Mesh(floorGeometry, floorMaterial);
+  floor.rotation.x = Math.PI / 2;
+  floor.position.y = -5;
+  floor.receiveShadow = true;
+  scene.add(floor);
+  
+  // Add initial grid
+  const gridHelper = new THREE.GridHelper(floorSize, 50, 0xAAAAAA, 0x888888);
+  gridHelper.position.y = -4.95;
+  gridHelper.material.opacity = 0.3;
+  gridHelper.material.transparent = true;
+  scene.add(gridHelper);
+  
+  // Add a second, larger grid for more depth
+  const largeGridHelper = new THREE.GridHelper(floorSize, 10, 0x666666, 0x666666);
+  largeGridHelper.position.y = -4.9;
+  largeGridHelper.material.opacity = 0.5;
+  largeGridHelper.material.transparent = true;
+  scene.add(largeGridHelper);
+
+  // Create bars
+  createBars();
+
+  // Animation loop
+  animate();
+  
+  // Don't start animation automatically
+  // Wait for user to click Start Animation button
+
+  // Handle window resize
+  window.addEventListener('resize', onWindowResize);
+  
+  // No UI controls needed - they're in the template
+};
+
+// Function to update floor and grid size based on data length
+  const updateFloorAndGridSize = () => {
+    if (!props.data || !props.data.data || props.data.data.length === 0) return;
+    
+    // Calculate floor size based on data length
+    const spacing = 4; // Same spacing as used for bars
+    const dataLength = props.data.data.length;
+    // Calculate required width based on data length and spacing
+    // Add extra padding (20 units) on each side for visual appeal
+    const floorSize = Math.max(100, (dataLength * spacing) + 40);
+    
+    // Remove existing floor and grids
+    scene.children.forEach(child => {
+      if (child === floor || child instanceof THREE.GridHelper) {
+        scene.remove(child);
+      }
+    });
+    
+    // Create new floor with updated size
+    const floorGeometry = new THREE.PlaneGeometry(floorSize, floorSize);
+    // Use import.meta.url to get correct path in Vite
+    const floorTexture = new THREE.TextureLoader().load(new URL('/floor.jpg', import.meta.url).href);
+    
+    // Set texture repeat to cover large floor area
+    floorTexture.wrapS = THREE.RepeatWrapping;
+    floorTexture.wrapT = THREE.RepeatWrapping;
+    // Adjust texture repeat based on floor size
+    const repeatCount = Math.ceil(floorSize / 10);
+    floorTexture.repeat.set(repeatCount, repeatCount);
+    
+    const floorMaterial = new THREE.MeshStandardMaterial({ 
+      map: floorTexture,
+      roughness: 0.8,
+      metalness: 0.2,
+      side: THREE.DoubleSide
+    });
+    
+    floor = new THREE.Mesh(floorGeometry, floorMaterial);
+    floor.rotation.x = Math.PI / 2;
+    floor.position.y = -5;
+    floor.receiveShadow = true;
+    scene.add(floor);
+    
+    // Add enhanced grid with more detail - subtle grid that complements the floor texture
+    const gridHelper = new THREE.GridHelper(floorSize, Math.floor(floorSize/2), 0xAAAAAA, 0x888888); // Subtle gray grid
+    gridHelper.position.y = -4.95; // Very slightly above floor
+    gridHelper.material.opacity = 0.3; // Make grid semi-transparent
+    gridHelper.material.transparent = true; // Enable transparency
+    scene.add(gridHelper);
+    
+    // Add a second, larger grid for more depth
+    const largeGridHelper = new THREE.GridHelper(floorSize, Math.floor(floorSize/10), 0x666666, 0x666666); // Darker, larger grid
+    largeGridHelper.position.y = -4.9; // Slightly above the first grid
+    largeGridHelper.material.opacity = 0.5; // Make grid semi-transparent
+    largeGridHelper.material.transparent = true; // Enable transparency
+    scene.add(largeGridHelper);
+  };
+
+// Create 3D bars
+  const createBars = () => {
+    if (!props.data || !props.data.data || props.data.data.length === 0) return;
+
+    // Reset animation state
+    currentRank.value = 0;
+    animationInProgress = false;
+    
+    // Update floor and grid size based on data length
+    updateFloorAndGridSize();
+    
+    // If in camera setup mode, create all bars but don't animate them
+    // This allows the user to see the full chart while setting up the camera
+  
+    // Clear existing objects
+    bars.forEach(bar => scene.remove(bar));
+    labels.forEach(label => scene.remove(label));
+    flagSprites.forEach(sprite => scene.remove(sprite));
+    // Also remove any spotlights that might be lingering
+    scene.children.forEach(child => {
+      if (child instanceof THREE.SpotLight) {
+        scene.remove(child);
+      }
+    });
+    bars = [];
+    labels = [];
+    flagSprites = [];
+
+    // Sort data by value (ascending) - from smallest to largest
+    const sortedData = [...props.data.data].sort((a, b) => a.value - b.value);
+  
+  // Calculate max value for scaling
+  const maxValue = Math.max(...sortedData.map(item => item.value));
+  const currentTheme = themes[props.theme as keyof typeof themes];
+  
+  // Create bars
+  sortedData.forEach((item, index) => {
+    // Calculate bar height based on value (tidak dibatasi maksimumnya)
+    const height = (item.value / maxValue) * 15; // Menggunakan faktor yang lebih tinggi
+    
+    // Create bar geometry
+    const geometry = new THREE.BoxGeometry(2, height, 2);
+    
+    // Create gradient material based on value (low to high)
+    const normalizedValue = item.value / maxValue; // 0 to 1
+    
+    // Create a color gradient based on theme
+    const lowColor = new THREE.Color(currentTheme.barColors.low);   // Low value color
+    const midColor = new THREE.Color(currentTheme.barColors.mid);   // Mid value color
+    const highColor = new THREE.Color(currentTheme.barColors.high);  // High value color
+    
+    // Determine color based on value range
+    let barColor;
+    if (normalizedValue < 0.5) {
+      // Interpolate between low and mid colors
+      barColor = new THREE.Color().lerpColors(lowColor, midColor, normalizedValue * 2);
+    } else {
+      // Interpolate between mid and high colors
+      barColor = new THREE.Color().lerpColors(midColor, highColor, (normalizedValue - 0.5) * 2);
+    }
+    
+    // Create material with enhanced emissive effect for top glow
+    const material = new THREE.MeshStandardMaterial({
+      color: barColor,
+      roughness: 0.2,
+      metalness: 0.8,
+      emissive: barColor.clone().multiplyScalar(0.4), // Stronger glow
+      emissiveIntensity: 1 + normalizedValue * 0.5 // More intense for higher values
+    });
+    
+    // Create mesh
+    const bar = new THREE.Mesh(geometry, material);
+    bar.castShadow = true;
+    bar.receiveShadow = true;
+    
+    // Position bar
+    const spacing = 4; // Wider spacing
+    const xPos = index * spacing - (sortedData.length - 1) * spacing / 2;
+    bar.position.set(xPos, height / 2 - 5, 0); // Center Y position based on height
+    
+    // Set initial scale for animation
+    bar.visible = false; // Hide initially
+    
+    // Add to scene and bars array
+    scene.add(bar);
+    bars.push(bar);
+    
+    // Create CSS2D label that will be positioned on the front face of the bar
+    const labelDiv = document.createElement('div');
+    labelDiv.className = 'bar-label';
+    labelDiv.style.color = currentTheme.textColor;
+    labelDiv.style.fontFamily = 'Arial, sans-serif';
+    labelDiv.style.padding = '1px 2px';
+    labelDiv.style.background = 'rgba(0, 0, 0, 0.3)'; // Very transparent
+    labelDiv.style.borderRadius = '0px'; // No rounded corners for more realistic look
+    labelDiv.style.pointerEvents = 'none';
+    labelDiv.style.width = '2em'; // Match bar width exactly (2 units in Three.js)
+    labelDiv.style.textAlign = 'center';
+    labelDiv.style.opacity = '0'; // Start invisible
+    labelDiv.style.transition = 'opacity 0.5s';
+    labelDiv.style.display = 'flex';
+    labelDiv.style.flexDirection = 'column';
+    labelDiv.style.alignItems = 'center';
+    labelDiv.style.justifyContent = 'center';
+    labelDiv.style.minWidth = '2em'; // Exactly match bar width
+    labelDiv.style.maxWidth = '2em'; // Exactly match bar width
+    labelDiv.style.transform = 'scale(0.9)'; // Slightly smaller to fit within bar
+    
+    // Rank number with compact styling
+    const rankSpan = document.createElement('span');
+    rankSpan.textContent = `#${sortedData.length - index}`; // Reverse rank numbering
+    rankSpan.style.fontSize = '8px';
+    rankSpan.style.fontWeight = 'bold';
+    rankSpan.style.display = 'block';
+    rankSpan.style.lineHeight = '1';
+    rankSpan.style.color = normalizedValue > 0.66 ? '#ffcc00' : currentTheme.textColor; // Gold for top ranks
+    labelDiv.appendChild(rankSpan);
+    
+    // Country/item name
+    const nameSpan = document.createElement('span');
+    nameSpan.textContent = item.name;
+    nameSpan.style.fontSize = '7px';
+    nameSpan.style.fontWeight = 'bold';
+    nameSpan.style.display = 'block';
+    nameSpan.style.marginTop = '0px';
+    nameSpan.style.lineHeight = '1';
+    labelDiv.appendChild(nameSpan);
+    
+    // Value with unit
+    const valueSpan = document.createElement('span');
+    valueSpan.textContent = `${item.value.toLocaleString()}`;
+    valueSpan.style.fontSize = '7px';
+    valueSpan.style.display = 'block';
+    valueSpan.style.marginTop = '0px';
+    valueSpan.style.lineHeight = '1';
+    labelDiv.appendChild(valueSpan);
+    
+    const label = new CSS2DObject(labelDiv);
+    // Position label with perspective matching the 3D bar chart
+    // Adjust position to match the perspective of the 3D chart
+    label.position.set(0, 0, 1.01); // Just slightly in front of the bar
+    // Apply rotation to match the perspective of the chart
+    label.rotation.x = -0.15; // Slight tilt to match the camera perspective
+    label.rotation.y = 0.05; // Slight horizontal tilt for better 3D effect
+    bar.add(label); // Attach to bar
+    labels.push(label);
+    
+    // Create flag sprite (placeholder - in real app, would load country flags)
+    const flagCanvas = document.createElement('canvas');
+    const flagContext = flagCanvas.getContext('2d');
+    if (flagContext) {
+      // Make flag width match bar width (2 units in Three.js = 128px in canvas for better resolution)
+      flagCanvas.width = 128;
+      flagCanvas.height = 64;
+      
+      // Draw a simple placeholder flag
+      flagContext.fillStyle = `hsl(${index * 30}, 80%, 60%)`;
+      flagContext.fillRect(0, 0, 128, 64);
+      flagContext.strokeStyle = 'white';
+      flagContext.lineWidth = 2;
+      flagContext.strokeRect(2, 2, 124, 60);
+      
+      // Add initial
+      flagContext.fillStyle = 'white';
+      flagContext.font = 'bold 32px Arial';
+      flagContext.textAlign = 'center';
+      flagContext.textBaseline = 'middle';
+      flagContext.fillText(item.name.charAt(0), 64, 32);
+    }
+    
+    const flagTexture = new THREE.CanvasTexture(flagCanvas);
+    const flagMaterial = new THREE.SpriteMaterial({ map: flagTexture });
+    const flagSprite = new THREE.Sprite(flagMaterial);
+    // Scale to match bar width but slightly smaller for better proportion
+     flagSprite.scale.set(1.8, 0.9, 1);
+     // Position above the bar with increased height to avoid collision
+     flagSprite.position.set(0, height/2 + 0.5, 0.2); // Moved higher above the bar
+    flagSprite.visible = false; // Hide initially
+    
+    bar.add(flagSprite);
+    flagSprites.push(flagSprite);
+  });
+  
+  // If in camera setup mode, show all bars without animation
+  if (isCameraSetupMode.value) {
+    // Make all bars visible immediately
+    bars.forEach((bar, index) => {
+      bar.visible = true;
+      
+      // Show flags
+      if (index < flagSprites.length) {
+        flagSprites[index].visible = true;
+      }
+      
+      // Show labels
+      if (index < labels.length) {
+        const labelElement = labels[index].element as HTMLElement;
+        labelElement.style.opacity = '1';
+      }
+    });
+    
+    // Keep controls enabled for camera setup
+    controls.enabled = true;
+  }
+  // If animation has started, proceed with normal animation modes
+  else if (!isCameraSetupMode.value) {
+    // If we have saved camera position and target from setup mode, restore them
+    if (savedCameraPosition && savedControlsTarget) {
+      // Set camera position and target to saved values
+      camera.position.copy(savedCameraPosition);
+      controls.target.copy(savedControlsTarget);
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+    
+    if (isSpotlightMode.value) {
+      // Start the spotlight animation with the current camera position
+      startSpotlightAnimation();
+    } else {
+      // Show all bars at once for lineup view
+      showLineupView();
+    }
+  }
+};
+
+// Spotlight animation - animate bars one by one with camera movement
+const startSpotlightAnimation = () => {
+  if (animationInProgress) return;
+  animationInProgress = true;
+  currentRank.value = 0; // Start from first rank (lowest value)
+  
+  // Process the first bar immediately without changing camera position
+  processNextBar();
+  
+  // Enable controls for user interaction during animation
+  controls.enabled = true;
+};
+
+// Process next bar in the spotlight sequence
+const processNextBar = () => {
+  if (currentRank.value >= bars.length) {
+    // Animation complete, transition to lineup view
+    transitionToLineupView();
+    return;
+  }
+  
+  const currentBar = bars[currentRank.value];
+  const currentLabel = labels[currentRank.value];
+  const currentFlag = flagSprites[currentRank.value];
+  
+  // Make current bar visible
+  currentBar.visible = true;
+  
+  // Animate bar growth with simple growth effect - slower animation
+  const originalHeight = currentBar.scale.y;
+  currentBar.scale.y = 0.01; // Start with almost zero height
+  gsap.to(currentBar.scale, {
+    y: originalHeight,
+    duration: 1.5, // Increased duration for slower animation
+    ease: 'power1.inOut', // Smoother easing for more gradual animation
+    onUpdate: () => {
+      // Update bar position to keep it grounded
+      const newHeight = currentBar.geometry.parameters.height * currentBar.scale.y;
+      currentBar.position.y = newHeight / 2 - 5;
+    }
+  });
+  
+  // Show flag with increased delay to match slower animation
+  if (currentFlag) {
+    setTimeout(() => {
+      currentFlag.visible = true;
+    }, 600); // Increased delay
+  }
+  
+  // Show label with fade-in after bar animation
+  if (currentLabel) {
+    setTimeout(() => {
+      const labelElement = currentLabel.element as HTMLElement;
+      labelElement.style.opacity = '1';
+      // Add transition for smoother fade-in
+      labelElement.style.transition = 'opacity 0.8s ease-in-out';
+    }, 1000); // Increased delay
+  }
+  
+  // Add spotlight on the current bar
+  const spotlight = new THREE.SpotLight(0xffffff, 2);
+  spotlight.position.set(currentBar.position.x, 15, 10);
+  spotlight.target = currentBar;
+  spotlight.angle = Math.PI / 6;
+  spotlight.penumbra = 0.2;
+  spotlight.decay = 1.5;
+  spotlight.distance = 40;
+  spotlight.castShadow = true;
+  scene.add(spotlight);
+  
+  // Move camera to follow the current bar with dynamic zoom based on bar height
+  if (savedCameraPosition && savedControlsTarget) {
+    // Get the current bar's height
+    const barHeight = currentBar.geometry.parameters.height * currentBar.scale.y;
+    
+    // Calculate target position based on bar position - aim at middle of the bar
+    const targetPosition = new THREE.Vector3(
+      currentBar.position.x,
+      barHeight / 2 - 5, // Target middle of the bar
+      savedControlsTarget.z
+    );
+    
+    // Use original camera settings from setup mode for normal height bars
+    // Only adjust for very tall bars
+    const normalBarHeight = 8; // Threshold for what's considered a normal height bar
+    
+    if (barHeight <= normalBarHeight) {
+      // For normal height bars, use the original camera distance from setup
+      const originalDistance = new THREE.Vector3().subVectors(savedCameraPosition, savedControlsTarget).length();
+      
+      // Calculate camera position with original distance
+      const cameraDirection = new THREE.Vector3().subVectors(savedCameraPosition, savedControlsTarget).normalize();
+      const newCameraPosition = new THREE.Vector3();
+      newCameraPosition.copy(targetPosition).add(
+        cameraDirection.multiplyScalar(originalDistance)
+      );
+      
+      // Ensure camera is at least at the original height
+      newCameraPosition.y = Math.max(savedCameraPosition.y, targetPosition.y + 5);
+    } else {
+      // For tall bars, calculate camera distance dynamically
+      const baseDistance = 30; // Base distance for normal bars
+      const heightFactor = barHeight / normalBarHeight; // Scale factor based on height
+      const dynamicDistance = baseDistance * heightFactor;
+      
+      // Calculate camera position with dynamic distance
+      const cameraDirection = new THREE.Vector3().subVectors(savedCameraPosition, savedControlsTarget).normalize();
+      const newCameraPosition = new THREE.Vector3();
+      newCameraPosition.copy(targetPosition).add(
+        cameraDirection.multiplyScalar(dynamicDistance)
+      );
+      
+      // Ensure camera is high enough to see the bar
+    newCameraPosition.y = Math.max(targetPosition.y + 5, barHeight + 2);
+    
+    // Animate both camera and target movement - slower and smoother
+    gsap.to(controls.target, {
+      x: targetPosition.x,
+      y: targetPosition.y,
+      z: targetPosition.z,
+      duration: 1.8, // Increased duration for slower camera movement
+      ease: 'power1.inOut', // Smoother easing for more cinematic feel
+      onUpdate: () => controls.update()
+    });
+    
+    gsap.to(camera.position, {
+      x: newCameraPosition.x,
+      y: newCameraPosition.y,
+      z: newCameraPosition.z,
+      duration: 1.8, // Increased duration to match target animation
+      ease: 'power1.inOut', // Smoother easing
+      onUpdate: () => {
+        camera.lookAt(controls.target);
+        camera.updateProjectionMatrix(); // Ensure camera matrix is updated
+      }
+    });
+  }
+  
+  // Increment rank for next bar
+  currentRank.value++;
+  
+  // Wait longer before processing next bar
+  setTimeout(() => {
+    processNextBar();
+  }, 2000); // 2 second delay between bars for slower pacing
+};
+
+// Transition to lineup view after spotlight animation with cinematic camera movement
+const transitionToLineupView = () => {
+  // Find the tallest bar to adjust camera position if needed
+  let maxBarHeight = 0;
+  bars.forEach(bar => {
+    const barHeight = bar.geometry.parameters.height * bar.scale.y;
+    if (barHeight > maxBarHeight) {
+      maxBarHeight = barHeight;
+    }
+  });
+  
+  // Make all bars visible with staggered animation
+  bars.forEach((bar, index) => {
+    bar.visible = true;
+    
+    // Add a slight staggered delay for a wave-like effect
+    setTimeout(() => {
+      // Show flags with smooth fade
+      if (index < flagSprites.length) {
+        flagSprites[index].visible = true;
+      }
+      
+      // Show labels with smooth fade
+      if (index < labels.length) {
+        const labelElement = labels[index].element as HTMLElement;
+        labelElement.style.transition = 'opacity 0.8s ease-in-out';
+        labelElement.style.opacity = '1';
+      }
+    }, index * 100); // Staggered delay based on index
+  });
+  
+  // If we have saved camera position and target from setup mode, adjust camera based on bar heights
+  if (savedCameraPosition && savedControlsTarget) {
+    // Calculate the center position of all bars
+    const centerX = (bars.length > 0) ? 
+      (bars[0].position.x + bars[bars.length - 1].position.x) / 2 : 
+      savedControlsTarget.x;
+    
+    // Create a target position at the center of all bars
+    const centerTarget = new THREE.Vector3(
+      centerX,
+      maxBarHeight / 3, // Look at about 1/3 up the tallest bar
+      savedControlsTarget.z
+    );
+    
+    // Calculate required camera distance based on bar spread
+    const barSpread = (bars.length > 1) ? 
+      Math.abs(bars[0].position.x - bars[bars.length - 1].position.x) : 
+      10;
+    
+    // Use original camera settings from setup mode for normal height bars
+    // Only adjust for very tall bars or wide spreads
+    const normalBarHeight = 8; // Threshold for what's considered a normal height bar
+    const normalSpread = 20; // Threshold for what's considered a normal spread
+    
+    // Get original distance from setup
+    const originalDistance = new THREE.Vector3().subVectors(savedCameraPosition, savedControlsTarget).length();
+    
+    // Calculate camera direction from original saved position
+    const cameraDirection = new THREE.Vector3()
+      .subVectors(savedCameraPosition, savedControlsTarget)
+      .normalize();
+    
+    // Create new camera position
+    const newCameraPosition = new THREE.Vector3();
+    
+    if (maxBarHeight <= normalBarHeight && barSpread <= normalSpread) {
+      // For normal height bars and normal spread, use the original camera distance from setup
+      newCameraPosition.copy(centerTarget).add(
+        cameraDirection.multiplyScalar(originalDistance)
+      );
+      
+      // Ensure camera is at least at the original height
+      newCameraPosition.y = Math.max(savedCameraPosition.y, centerTarget.y + 5);
+    } else {
+      // For tall bars or wide spreads, calculate camera distance dynamically
+      const heightFactor = maxBarHeight > normalBarHeight ? maxBarHeight / normalBarHeight : 1;
+      const spreadFactor = barSpread > normalSpread ? barSpread / normalSpread : 1;
+      const dynamicDistance = originalDistance * Math.max(heightFactor, spreadFactor);
+      
+      newCameraPosition.copy(centerTarget).add(
+        cameraDirection.multiplyScalar(dynamicDistance)
+      );
+      
+      // Ensure camera is high enough for tall bars
+      newCameraPosition.y = Math.max(newCameraPosition.y, maxBarHeight + 5);
+    }
+    
+    // Animate camera position and target to calculated values
+    gsap.to(camera.position, {
+      x: newCameraPosition.x,
+      y: newCameraPosition.y,
+      z: newCameraPosition.z,
+      duration: 2.5, // Slow, cinematic camera movement
+      ease: 'power1.inOut',
+      onUpdate: () => camera.updateProjectionMatrix()
+    });
+    
+    gsap.to(controls.target, {
+      x: centerTarget.x,
+      y: centerTarget.y,
+      z: centerTarget.z,
+      duration: 2.5, // Match camera animation duration
+      ease: 'power1.inOut',
+      onUpdate: () => controls.update()
+    });
+  }
+  
+  // Enable controls for user interaction
+  controls.enabled = true;
+  animationInProgress = false;
+  isSpotlightMode.value = false;
+  
+  // Start auto-rotation if enabled
+  if (isAutoCamEnabled.value) {
+    startAutoCam();
+  }
+};
+
+// Show all bars at once (lineup view) with smooth transitions
+const showLineupView = () => {
+  // Find the tallest bar to adjust camera position if needed
+  let maxBarHeight = 0;
+  bars.forEach(bar => {
+    const barHeight = bar.geometry.parameters.height * bar.scale.y;
+    if (barHeight > maxBarHeight) {
+      maxBarHeight = barHeight;
+    }
+  });
+  
+  // Make all bars visible with staggered animation
+  bars.forEach((bar, index) => {
+    bar.visible = true;
+    
+    // Add a slight staggered delay for a wave-like effect
+    setTimeout(() => {
+      // Show flags with smooth fade
+      if (index < flagSprites.length) {
+        flagSprites[index].visible = true;
+      }
+      
+      // Show labels with smooth fade
+      if (index < labels.length) {
+        const labelElement = labels[index].element as HTMLElement;
+        labelElement.style.transition = 'opacity 0.8s ease-in-out';
+        labelElement.style.opacity = '1';
+      }
+    }, index * 80); // Staggered delay based on index, slightly faster than in transitionToLineupView
+  });
+  
+  // If we have saved camera position and target from setup mode, adjust camera based on bar heights
+  if (savedCameraPosition && savedControlsTarget) {
+    // Calculate the center position of all bars
+    const centerX = (bars.length > 0) ? 
+      (bars[0].position.x + bars[bars.length - 1].position.x) / 2 : 
+      savedControlsTarget.x;
+    
+    // Create a target position at the center of all bars
+    const centerTarget = new THREE.Vector3(
+      centerX,
+      maxBarHeight / 3, // Look at about 1/3 up the tallest bar
+      savedControlsTarget.z
+    );
+    
+    // Calculate required camera distance based on bar spread
+    const barSpread = (bars.length > 1) ? 
+      Math.abs(bars[0].position.x - bars[bars.length - 1].position.x) : 
+      10;
+    
+    // Use original camera settings from setup mode for normal height bars
+    // Only adjust for very tall bars or wide spreads
+    const normalBarHeight = 8; // Threshold for what's considered a normal height bar
+    const normalSpread = 20; // Threshold for what's considered a normal spread
+    
+    // Get original distance from setup
+    const originalDistance = new THREE.Vector3().subVectors(savedCameraPosition, savedControlsTarget).length();
+    
+    // Calculate camera direction from original saved position
+    const cameraDirection = new THREE.Vector3()
+      .subVectors(savedCameraPosition, savedControlsTarget)
+      .normalize();
+    
+    // Create new camera position
+    const newCameraPosition = new THREE.Vector3();
+    
+    if (maxBarHeight <= normalBarHeight && barSpread <= normalSpread) {
+      // For normal height bars and normal spread, use the original camera distance from setup
+      newCameraPosition.copy(centerTarget).add(
+        cameraDirection.multiplyScalar(originalDistance)
+      );
+      
+      // Ensure camera is at least at the original height
+      newCameraPosition.y = Math.max(savedCameraPosition.y, centerTarget.y + 5);
+    } else {
+      // For tall bars or wide spreads, calculate camera distance dynamically
+      const heightFactor = maxBarHeight > normalBarHeight ? maxBarHeight / normalBarHeight : 1;
+      const spreadFactor = barSpread > normalSpread ? barSpread / normalSpread : 1;
+      const dynamicDistance = originalDistance * Math.max(heightFactor, spreadFactor);
+      
+      newCameraPosition.copy(centerTarget).add(
+        cameraDirection.multiplyScalar(dynamicDistance)
+      );
+      
+      // Ensure camera is high enough for tall bars
+      newCameraPosition.y = Math.max(newCameraPosition.y, maxBarHeight + 5);
+    }
+    
+    // Animate camera position and target to calculated values
+    gsap.to(camera.position, {
+      x: newCameraPosition.x,
+      y: newCameraPosition.y,
+      z: newCameraPosition.z,
+      duration: 2.0, // Slow, cinematic camera movement
+      ease: 'power1.inOut',
+      onUpdate: () => camera.updateProjectionMatrix()
+    });
+    
+    gsap.to(controls.target, {
+      x: centerTarget.x,
+      y: centerTarget.y,
+      z: centerTarget.z,
+      duration: 2.0, // Match camera animation duration
+      ease: 'power1.inOut',
+      onUpdate: () => controls.update()
+    });
+  }
+  
+  // Enable controls for user interaction
+  controls.enabled = true;
+  
+  // Start auto-rotation if enabled
+  if (isAutoCamEnabled.value) {
+    startAutoCam();
+  }
+};
+
+// Start auto camera rotation - slower and smoother
+const startAutoCam = () => {
+  if (autoCamAnimation) {
+    autoCamAnimation.kill();
+  }
+  
+  // Get the current camera distance from target
+  const currentDistance = camera.position.distanceTo(controls.target);
+  
+  // Create a much slower and smoother orbit animation that maintains the same distance
+  autoCamAnimation = gsap.to(camera.position, {
+    duration: 40, // Much longer duration for slower rotation
+    x: () => controls.target.x + currentDistance * Math.sin(Date.now() * 0.00005), // Slower rotation speed
+    z: () => controls.target.z + currentDistance * Math.cos(Date.now() * 0.00005), // Slower rotation speed
+    y: camera.position.y, // Keep the same height
+    repeat: -1,
+    ease: 'power1.inOut', // Smoother easing for more cinematic feel
+    onUpdate: () => {
+      camera.lookAt(controls.target);
+      // Ensure smooth camera movement
+      camera.updateProjectionMatrix();
+      controls.update();
+    }
+  });
+};
+
+// Stop auto camera rotation
+const stopAutoCam = () => {
+  if (autoCamAnimation) {
+    autoCamAnimation.kill();
+    autoCamAnimation = null;
+  }
+};
+
+// Restart animation
+const restartAnimation = () => {
+  // Stop auto camera if running
+  stopAutoCam();
+  
+  // Reset mode
+  isSpotlightMode.value = true;
+  
+  // First, remove all bars from scene
+  bars.forEach(bar => {
+    if (bar) {
+      scene.remove(bar);
+    }
+  });
+  
+  // Remove all existing labels from scene and DOM
+  labels.forEach(label => {
+    if (label && label.parent) {
+      label.parent.remove(label);
+    }
+    // Also set opacity to 0 for any elements that might still be in the DOM
+    const labelElement = label?.element as HTMLElement;
+    if (labelElement) {
+      labelElement.style.opacity = '0';
+      // Remove from DOM completely
+      if (labelElement.parentNode) {
+        labelElement.parentNode.removeChild(labelElement);
+      }
+    }
+  });
+  
+  // Remove all flags
+  flagSprites.forEach(flag => {
+    if (flag && flag.parent) {
+      flag.parent.remove(flag);
+    }
+  });
+  
+  // Also check for any remaining CSS2DObjects in the scene
+  scene.traverse(object => {
+    if (object instanceof CSS2DObject) {
+      if (object.parent) {
+        object.parent.remove(object);
+      }
+    }
+  });
+  
+  // Clear arrays
+  bars = [];
+  labels = [];
+  flagSprites = [];
+  
+  // Completely clear and recreate the labelRenderer to ensure all labels are removed
+  if (chartContainer.value) {
+    // Remove existing labelRenderer from DOM
+    if (labelRenderer && labelRenderer.domElement && labelRenderer.domElement.parentNode) {
+      labelRenderer.domElement.parentNode.removeChild(labelRenderer.domElement);
+    }
+    
+    // Create a new CSS2D renderer for labels
+    labelRenderer = new CSS2DRenderer();
+    const width = chartContainer.value.clientWidth;
+    
+    // Set renderer size to maintain 16:9 aspect ratio
+    labelRenderer.setSize(width, width * (9/16));
+    labelRenderer.domElement.style.position = 'absolute';
+    labelRenderer.domElement.style.top = '0';
+    labelRenderer.domElement.style.left = '0';
+    labelRenderer.domElement.style.right = '0';
+    labelRenderer.domElement.style.margin = '0 auto';
+    labelRenderer.domElement.style.pointerEvents = 'none';
+    chartContainer.value.appendChild(labelRenderer.domElement);
+  } else {
+    // If no container, just force a render to clear existing labels
+    labelRenderer.render(scene, camera);
+  }
+  
+  // Recreate bars and restart animation
+  createBars();
+};
+
+// Handle window resize
+const onWindowResize = () => {
+  if (!chartContainer.value) return;
+  
+  const width = chartContainer.value.clientWidth;
+  
+  // Maintain fixed 16:9 aspect ratio for camera
+  camera.aspect = 16 / 9;
+  camera.updateProjectionMatrix();
+  
+  // Set renderer size to maintain 16:9 aspect ratio
+  renderer.setSize(width, width * (9/16));
+  labelRenderer.setSize(width, width * (9/16));
+};
+
+// Animation loop
+const animate = () => {
+  requestAnimationFrame(animate);
+  
+  // Keep controls enabled for camera setup mode
+  if (isCameraSetupMode.value) {
+    controls.enabled = true;
+  }
+  
+  controls.update();
+  renderer.render(scene, camera);
+  labelRenderer.render(scene, camera);
+  
+  // Capture frame if recording
+  if (isRecording.value && capturer) {
+    capturer.capture(renderer.domElement);
+    
+    // Update recording progress
+    const currentTime = Date.now();
+    const elapsed = currentTime - recordingStartTime;
+    recordingProgress.value = Math.min(100, Math.floor((elapsed / recordingDuration) * 100));
+    
+    // Auto-stop recording when duration is reached
+    if (elapsed >= recordingDuration) {
+      stopRecording();
+    }
+  }
+  
+  // If in camera setup mode, don't run animations
+  // Just render the scene with controls enabled
+  if (isCameraSetupMode.value) {
+    // Keep controls enabled for camera positioning
+    controls.enabled = true;
+  }
+};
+
+// Start recording
+const startRecording = () => {
+  if (isRecording.value) return;
+  
+  // Initialize CCapture
+  capturer = new CCapture({
+    format: 'webm',
+    framerate: 60,
+    verbose: false,
+    display: true,
+    quality: 100,
+    name: 'cobastat-animation'
+  });
+  
+  // Start recording
+  capturer.start();
+  isRecording.value = true;
+  recordingStartTime = Date.now();
+  recordingProgress.value = 0;
+  
+  // Set recording duration based on animation mode
+  // For spotlight mode, calculate approximate duration based on number of bars
+  if (isSpotlightMode.value) {
+    // Each bar takes about 3 seconds to animate + 1 second pause
+    recordingDuration = (bars.length * 4 + 3) * 1000; // Add 3 seconds for final transition
+  } else {
+    // For lineup mode, use a fixed duration
+    recordingDuration = 10000; // 10 seconds
+  }
+  
+  // Restart animation to capture from beginning
+  restartAnimation();
+};
+
+// Stop recording and save video
+const stopRecording = () => {
+  if (!isRecording.value || !capturer) return;
+  
+  // Stop recording
+  capturer.stop();
+  isRecording.value = false;
+  recordingProgress.value = 100;
+  
+  // Save the video
+  capturer.save((blob: Blob) => {
+    // Create download link
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'cobastat-animation.webm';
+    document.body.appendChild(a);
+    a.click();
+    
+    // Clean up
+    setTimeout(() => {
+      document.body.removeChild(a);
+      window.URL.revokeObjectURL(url);
+    }, 100);
+  });
+  
+  // Reset capturer
+  capturer = null;
+};
+
+// Watch for theme changes
+watch(() => props.theme, (newTheme) => {
+  const currentTheme = themes[newTheme as keyof typeof themes] || themes.default;
+  
+  // Update scene properties
+  if (scene) {
+    // Handle background based on theme
+    if (newTheme === 'sky') {
+      // For sky theme, use the sky texture
+      const textureLoader = new THREE.TextureLoader();
+      // Use import.meta.url to get correct path in Vite
+      const skyTexture = textureLoader.load(new URL('/sky.jpg', import.meta.url).href);
+      scene.background = skyTexture;
+    } else {
+      // For other themes, use the solid color
+      scene.background = new THREE.Color(currentTheme.background);
+    }
+    
+    // Update fog
+    if (scene.fog && scene.fog instanceof THREE.FogExp2) {
+      scene.fog.color = new THREE.Color(currentTheme.fogColor);
+      scene.fog.density = currentTheme.fogDensity;
+    }
+    
+    // Update floor appearance based on theme
+    if (floor) {
+      const floorMat = (floor.material as THREE.MeshStandardMaterial);
+      
+      // Handle floor based on theme
+      if (newTheme === 'sky') {
+        // For sky theme, use the floor texture
+        const floorTextureLoader = new THREE.TextureLoader();
+        // Use import.meta.url to get correct path in Vite
+        const floorTexture = floorTextureLoader.load(new URL('/floor.jpg', import.meta.url).href);
+        
+        // Set texture repeat to cover large floor area
+        floorTexture.wrapS = THREE.RepeatWrapping;
+        floorTexture.wrapT = THREE.RepeatWrapping;
+        floorTexture.repeat.set(10, 10); // Repeat texture 10x10 times
+        
+        floorMat.map = floorTexture;
+        floorMat.needsUpdate = true;
+      } else {
+        // For other themes, use solid color
+        floorMat.map = null;
+        floorMat.color.set(currentTheme.floorColor);
+        floorMat.needsUpdate = true;
+      }
+    }
+    
+    // Update grid colors
+    scene.children.forEach(child => {
+      if (child instanceof THREE.GridHelper) {
+        if (child.position.y === -4.95) { // Small grid
+          (child.material as THREE.Material).color.setHex(currentTheme.gridColor);
+        } else if (child.position.y === -4.9) { // Large grid
+          (child.material as THREE.Material).color.setHex(currentTheme.gridColor2 || currentTheme.gridColor);
+        }
+      }
+    });
+  }
+  
+  // Recreate bars with new theme
+  createBars();
+});
+
+// Watch for data changes
+watch(() => props.data, () => {
+  // Reset to spotlight mode for new data
+  isSpotlightMode.value = true;
+  
+  // Stop any ongoing animations
+  stopAutoCam();
+  
+  // Recreate bars when data changes
+  if (scene) {
+    createBars();
+  }
+}, { deep: true });
+
+// Watch for spotlight mode changes
+watch(isSpotlightMode, (newMode) => {
+  // Recreate bars when mode changes
+  if (scene && !animationInProgress) {
+    createBars();
+  }
+});
+
+// Watch for auto camera mode changes
+watch(isAutoCamEnabled, (enabled) => {
+  if (enabled && !animationInProgress) {
+    startAutoCam();
+  } else {
+    stopAutoCam();
+  }
+});
+
+// Start animation from camera setup mode
+const startAnimation = () => {
+  // Save current camera position and controls target before switching modes
+  savedCameraPosition = camera.position.clone();
+  savedControlsTarget = controls.target.clone();
+  
+  // Switch from camera setup mode to animation mode
+  isCameraSetupMode.value = false;
+  isAnimationStarted.value = true;
+  
+  // Clean up existing labels before restarting animation
+  // First, remove all bars from scene
+  bars.forEach(bar => {
+    if (bar) {
+      scene.remove(bar);
+    }
+  });
+  
+  // Remove all existing labels from scene and DOM
+  labels.forEach(label => {
+    if (label && label.parent) {
+      label.parent.remove(label);
+    }
+    // Also set opacity to 0 for any elements that might still be in the DOM
+    const labelElement = label?.element as HTMLElement;
+    if (labelElement) {
+      labelElement.style.opacity = '0';
+      // Remove from DOM completely
+      if (labelElement.parentNode) {
+        labelElement.parentNode.removeChild(labelElement);
+      }
+    }
+  });
+  
+  // Remove all flags
+  flagSprites.forEach(flag => {
+    if (flag && flag.parent) {
+      flag.parent.remove(flag);
+    }
+  });
+  
+  // Also check for any remaining CSS2DObjects in the scene
+  scene.traverse(object => {
+    if (object instanceof CSS2DObject) {
+      if (object.parent) {
+        object.parent.remove(object);
+      }
+    }
+  });
+  
+  // Clear arrays
+  bars = [];
+  labels = [];
+  flagSprites = [];
+  
+  // Restart animation with current camera position
+  createBars();
+};
+
+// Reset to camera setup mode
+const resetCameraSetup = () => {
+  // Switch back to camera setup mode
+  isCameraSetupMode.value = true;
+  isAnimationStarted.value = false;
+  
+  // Reset saved camera position and target
+  savedCameraPosition = null;
+  savedControlsTarget = null;
+  
+  // Recreate bars in setup mode
+  createBars();
+  
+  // Make sure controls are enabled
+  controls.enabled = true;
+};
+
+// Initialize on mount
+onMounted(() => {
+  initScene();
+});
+
+// Cleanup on unmount
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onWindowResize);
+  
+  // Stop animations
+  if (autoCamAnimation) {
+    autoCamAnimation.kill();
+  }
+  
+  // Dispose of Three.js resources
+  if (renderer) {
+    renderer.dispose();
+  }
+  
+  if (labelRenderer) {
+    // Remove label renderer from DOM
+    if (chartContainer.value && labelRenderer.domElement) {
+      chartContainer.value.removeChild(labelRenderer.domElement);
+    }
+  }
+  
+  // Clear scene
+  if (scene) {
+    scene.clear();
+  }
+});
+</script>
+
+<template>
+  <div class="chart-container-wrapper">
+    <div class="chart-wrapper">
+      <div ref="chartContainer" class="chart-container">
+      </div>
+    </div>
+    
+    <!-- Controls outside the chart container -->
+    <div class="controls-container">
+      <div v-if="isCameraSetupMode" class="camera-setup-container">
+        <div class="camera-setup-info">
+          <div class="setup-instructions">
+            <h3>Camera Setup Mode</h3>
+            <p>Atur posisi kamera sesuai keinginan Anda:</p>
+            <ul>
+              <li>Klik dan geser untuk memutar kamera</li>
+              <li>Scroll untuk zoom in/out</li>
+              <li>Klik kanan dan geser untuk menggeser kamera</li>
+            </ul>
+          </div>
+          <button @click="startAnimation" class="control-btn start-animation-btn">
+            <span class="icon">▶️</span> Mulai Animasi
+          </button>
+        </div>
+      </div>
+      <div v-else class="chart-controls">
+        <button @click="restartAnimation" class="control-btn">
+          <span class="icon">↺</span> Restart
+        </button>
+        <button @click="isAutoCamEnabled = !isAutoCamEnabled; isAutoCamEnabled ? startAutoCam() : stopAutoCam()" class="control-btn">
+          <span class="icon">🎥</span> {{ isAutoCamEnabled ? 'Stop' : 'Start' }} AutoCam
+        </button>
+        <button @click="isSpotlightMode = !isSpotlightMode; restartAnimation()" class="control-btn">
+          <span class="icon">🔦</span> {{ isSpotlightMode ? 'Lineup' : 'Spotlight' }} Mode
+        </button>
+        <button @click="resetCameraSetup" class="control-btn">
+          <span class="icon">🔧</span> Atur Kamera
+        </button>
+        <button @click="isRecording ? stopRecording() : startRecording()" class="control-btn" :class="{ 'recording': isRecording }">
+          <span class="icon">⏺</span> {{ isRecording ? 'Stop Recording' : 'Record Video' }}
+        </button>
+        <div v-if="isRecording" class="recording-progress">
+          <div class="progress-bar">
+            <div class="progress-fill" :style="{ width: recordingProgress + '%' }"></div>
+          </div>
+          <div class="progress-text">{{ recordingProgress }}%</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.chart-container-wrapper {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  gap: 15px;
+  padding: 20px;
+  box-sizing: border-box;
+}
+
+.chart-wrapper {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16/9;
+  overflow: hidden;
+  border-radius: 8px;
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+  margin: 0 auto;
+  max-width: 1200px;
+}
+
+.chart-container {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  background: #121212;
+  border-radius: 8px;
+}
+
+.controls-container {
+  display: flex;
+  justify-content: center;
+  width: 100%;
+  padding: 10px 0;
+}
+
+.chart-controls {
+  display: flex;
+  justify-content: center;
+  gap: 10px;
+  padding: 15px 0;
+  width: 100%;
+}
+
+.control-btn {
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  border: none;
+  border-radius: 20px;
+  padding: 8px 15px;
+  font-size: 14px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  backdrop-filter: blur(5px);
+  transition: all 0.2s ease;
+  box-shadow: 0 2px 5px rgba(0, 0, 0, 0.2);
+}
+
+.control-btn:hover {
+  background: rgba(0, 0, 0, 0.9);
+  transform: scale(1.05);
+  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.3);
+}
+
+.control-btn.recording {
+  background: rgba(255, 0, 0, 0.7);
+  animation: pulse 1.5s infinite;
+}
+
+.control-btn.recording:hover {
+  background: rgba(255, 0, 0, 0.9);
+}
+
+.start-animation-btn {
+  background: rgba(0, 128, 0, 0.8);
+  font-size: 16px;
+  padding: 10px 20px;
+  margin-top: 15px;
+}
+
+.start-animation-btn:hover {
+  background: rgba(0, 150, 0, 0.9);
+}
+
+.camera-setup-container {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  margin-top: 20px;
+}
+
+.camera-setup-info {
+  background: rgba(0, 0, 0, 0.7);
+  padding: 15px;
+  border-radius: 8px;
+  max-width: 500px;
+  text-align: center;
+}
+
+.setup-instructions {
+  color: white;
+  margin-bottom: 10px;
+}
+
+.setup-instructions h3 {
+  margin: 0 0 10px 0;
+  font-size: 18px;
+  color: #4CAF50;
+}
+
+.setup-instructions p {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+}
+
+.setup-instructions ul {
+  text-align: left;
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+}
+
+.setup-instructions li {
+  margin-bottom: 4px;
+}
+
+@keyframes pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.4);
+  }
+  70% {
+    box-shadow: 0 0 0 10px rgba(255, 0, 0, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(255, 0, 0, 0);
+  }
+}
+
+.recording-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: 10px;
+  margin-top: 10px;
+  width: 100%;
+  max-width: 300px;
+}
+
+.progress-bar {
+  width: 100%;
+  height: 10px;
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #ff0000, #ff6b6b);
+  border-radius: 5px;
+  transition: width 0.3s ease;
+}
+
+.progress-text {
+  color: white;
+  font-size: 12px;
+  min-width: 40px;
+}
+
+.icon {
+  font-size: 16px;
+}
+
+/* Custom styles for bar labels */
+:deep(.bar-label) {
+  transform: translateX(-50%) scale(1) perspective(500px); /* Add perspective to match 3D view */
+  transform-origin: center;
+  white-space: normal;
+  box-shadow: none; /* Remove shadow for more realistic look */
+  border: none; /* Remove border for more realistic look */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transform-style: preserve-3d; /* Enhance 3D appearance */
+}
+</style>
